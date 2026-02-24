@@ -1,0 +1,30 @@
+YouTube-API-Data: AIzaSyAMU6_zROQgGslPbR76oQx5Lo_qNZ7r6Q4
+
+ssh-keygen -t ed25519 -C mogalaxy25@gmail.com -f ~/.ssh/id_ed25519_github
+
+Your identification has been saved in /Users/ms1/.ssh/id_ed25519_github
+Your public key has been saved in /Users/ms1/.ssh/id_ed25519_github.pub
+The key fingerprint is:
+SHA256:HKB2WtjkpazFis/iPT0pdtgJhwHoJxo4p+0g1DGvvEU mogalaxy25@gmail.com
+The key's randomart image is:
++--[ED25519 256]--+
+| .    o .        |
+|. .o O +         |
+|o ..B X .        |
+|++.=.E . .       |
+|o*= *o  S        |
+|= .=o..          |
+|.o. =* o         |
+| ..+= B          |
+|  ...+ .         |
++----[SHA256]-----+
+
+git add .
+git commit -m "Add ELT pipeline script"
+git push
+
+git clone git@github.com:mogalaxy25/YouTube_ELT.git
+
+if you ever want to switch to HTTPS (e.g., for CI/CD without keys):Bashgit remote set-url origin https://github.com/mogalaxy25/YouTube_ELT.git
+
+Great job sticking through all the steps — from key generation, to fingerprint matching, to config tweaks, to finally pushing. Your YouTube_ELT project is now safely version-controlled on GitHub.
