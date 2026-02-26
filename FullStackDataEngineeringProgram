@@ -1,0 +1,1130 @@
+fully merged, production-grade versions of:
+
+✅ client.py (retry + backoff + rolling quota tracker + thread-safe quota guard + parallel fetch)
+
+✅ main.py (multi-channel ingestion + weekly full refresh + 30-day recent refresh + alerts + partial_success handling)
+
+You can replace your current files entirely with these.
+
+✅ FINAL src/youtube_elt/client.py
+import logging
+import os
+import random
+import time
+from typing import Any, Dict, List, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+
+import requests
+from sqlalchemy.engine import Engine
+
+from .quota_tracker import add_quota_usage
+
+logger = logging.getLogger("youtube_elt")
+
+
+# Approx YouTube quota units
+ENDPOINT_UNITS = {
+    "search": 100,
+    "playlistItems": 1,
+    "videos": 1,
+    "channels": 1,
+}
+
+
+class QuotaGuard:
+    def __init__(self):
+        self.max_videos = int(os.getenv("MAX_VIDEOS_PER_RUN", 500))
+        self.max_calls = int(os.getenv("MAX_API_CALLS_PER_RUN", 200))
+        self.max_units = int(os.getenv("MAX_UNITS_PER_RUN", 2000))
+
+        self.video_count = 0
+        self.api_calls = 0
+        self.units_used = 0
+        self._lock = threading.Lock()
+
+    def record_call(self, endpoint: str) -> int:
+        units = ENDPOINT_UNITS.get(endpoint, 1)
+
+        with self._lock:
+            self.api_calls += 1
+            self.units_used += units
+
+            if self.api_calls > self.max_calls:
+                raise RuntimeError("QuotaGuard: Max API calls reached")
+
+            if self.units_used > self.max_units:
+                raise RuntimeError("QuotaGuard: Max units per run reached")
+
+        return units
+
+    def record_videos(self, count: int):
+        with self._lock:
+            self.video_count += count
+            if self.video_count > self.max_videos:
+                raise RuntimeError("QuotaGuard: Max videos per run reached")
+
+
+class YouTubeClient:
+    BASE_URL = "https://www.googleapis.com/youtube/v3"
+
+    def __init__(
+        self,
+        api_key: str,
+        engine: Engine | None = None,
+        timeout: int = 30,
+        max_retries: int = 6,
+        backoff_base: float = 1.5,
+        backoff_cap: float = 60.0,
+    ):
+        if not api_key:
+            raise ValueError("YOUTUBE_API_KEY is missing.")
+
+        self.api_key = api_key
+        self.engine = engine
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self.backoff_base = backoff_base
+        self.backoff_cap = backoff_cap
+        self.quota_guard = QuotaGuard()
+
+    def _sleep_backoff(self, attempt: int):
+        delay = min(self.backoff_cap, (self.backoff_base ** attempt)) + random.uniform(0, 0.5)
+        time.sleep(delay)
+
+    def _should_retry(self, status_code: Optional[int], payload: Optional[dict]) -> bool:
+        if status_code in (429, 500, 502, 503, 504):
+            return True
+
+        if status_code == 403 and payload:
+            err = payload.get("error", {})
+            errors = err.get("errors", []) if isinstance(err, dict) else []
+            reasons = {e.get("reason") for e in errors if isinstance(e, dict)}
+            if reasons & {"quotaExceeded", "dailyLimitExceeded", "userRateLimitExceeded", "rateLimitExceeded"}:
+                return True
+
+        return False
+
+    def _get(self, endpoint: str, params: dict) -> dict:
+        units = self.quota_guard.record_call(endpoint)
+
+        if self.engine:
+            add_quota_usage(self.engine, units=units, calls=1)
+
+        url = f"{self.BASE_URL}/{endpoint}"
+        params = {**params, "key": self.api_key}
+
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                resp = requests.get(url, params=params, timeout=self.timeout)
+                payload = resp.json() if resp.content else {}
+
+                if resp.ok:
+                    return payload
+
+                if self._should_retry(resp.status_code, payload) and attempt < self.max_retries:
+                    logger.warning("Retrying %s status=%s attempt=%s/%s",
+                                   endpoint, resp.status_code, attempt, self.max_retries)
+                    self._sleep_backoff(attempt)
+                    continue
+
+                resp.raise_for_status()
+                return payload
+
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+                if attempt < self.max_retries:
+                    self._sleep_backoff(attempt)
+                    continue
+                raise
+
+        raise RuntimeError("Unknown failure in _get")
+
+    # ------------------------------
+    # Parallel video detail fetch
+    # ------------------------------
+    def get_videos_details_parallel(self, video_ids: List[str]) -> List[Dict[str, Any]]:
+        if not video_ids:
+            return []
+
+        chunk_size = 50
+        chunks = [video_ids[i:i + chunk_size] for i in range(0, len(video_ids), chunk_size)]
+        max_workers = int(os.getenv("MAX_WORKERS", 4))
+
+        results: List[Dict[str, Any]] = []
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = []
+            for chunk in chunks:
+                self.quota_guard.record_videos(len(chunk))
+                futures.append(
+                    executor.submit(
+                        self._get,
+                        "videos",
+                        {"part": "snippet,contentDetails,statistics",
+                         "id": ",".join(chunk),
+                         "maxResults": 50},
+                    )
+                )
+
+            for future in as_completed(futures):
+                data = future.result()
+                results.extend(data.get("items", []))
+
+        return results
+✅ FINAL main.py (multi-channel + weekly full refresh + alerts)
+
+Replace your current file completely:
+
+import os
+import logging
+from dotenv import load_dotenv
+from sqlalchemy import create_engine
+import pandas as pd
+
+from .lineage import start_run, finish_run
+from .state import get_last_success_started_at
+from .recent_refresh import get_recent_video_ids
+from .extract import extract_incremental_and_recent
+from .full_refresh import extract_full_refresh
+from .schedule import is_weekly_full_refresh_day
+from .raw_store import store_raw_videos
+from .transform_rows import videos_raw_to_rows
+from .warehouse_upsert import upsert_curated_videos
+from .snapshots import write_metrics_snapshots
+from .lake import write_raw_jsonl, write_silver
+from .alerts import send_slack, send_email
+
+load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+)
+logger = logging.getLogger("youtube_elt")
+
+
+def run():
+    database_url = os.getenv("DATABASE_URL")
+    api_key = os.getenv("YOUTUBE_API_KEY")
+
+    if not database_url:
+        raise ValueError("DATABASE_URL required")
+
+    engine = create_engine(database_url)
+
+    handles_env = os.getenv("YOUTUBE_CHANNEL_HANDLES")
+    handles = [h.strip() for h in handles_env.split(",")] if handles_env else [os.getenv("YOUTUBE_CHANNEL_ID")]
+
+    for channel_handle in handles:
+        last_success = get_last_success_started_at(engine)
+
+        weekly = is_weekly_full_refresh_day(6)
+        mode = "full_refresh" if weekly else "incremental_recent"
+
+        recent_ids = get_recent_video_ids(engine, 30) if not weekly else []
+
+        run_id = start_run(
+            engine,
+            meta={
+                "channel_handle": channel_handle,
+                "mode": mode,
+            },
+        )
+
+        try:
+            if weekly:
+                payload = extract_full_refresh(api_key, channel_handle)
+            else:
+                payload = extract_incremental_and_recent(
+                    api_key, channel_handle, last_success, recent_ids
+                )
+
+            videos_raw = payload["videos_raw"]
+
+            write_raw_jsonl(run_id, videos_raw)
+            store_raw_videos(engine, run_id, videos_raw)
+
+            rows = videos_raw_to_rows(videos_raw, channel_handle)
+            df = pd.DataFrame(rows)
+
+            write_silver(run_id, df)
+            upsert_curated_videos(engine, run_id, rows)
+            write_metrics_snapshots(engine, run_id, rows)
+
+            finish_run(engine, run_id, "success")
+            logger.info("✅ %s complete (%s rows)", channel_handle, len(rows))
+
+        except RuntimeError as e:
+            msg = f"⚠️ Partial success (quota guard) channel={channel_handle} reason={str(e)}"
+            finish_run(engine, run_id, "partial_success", meta={"reason": str(e)})
+            send_slack(msg)
+            send_email("YouTube ELT partial_success", msg)
+            logger.warning(msg)
+
+        except Exception as e:
+            finish_run(engine, run_id, "failed", meta={"error": str(e)})
+            send_slack(f"❌ Failed channel={channel_handle}: {str(e)}")
+            raise
+
+
+if __name__ == "__main__":
+    run()
+🚀 What You Now Have
+
+You now run:
+
+🔄 Daily incremental + 30-day refresh
+
+📅 Weekly full refresh (Sunday)
+
+🧠 Rolling daily quota tracker
+
+🛑 Thread-safe quota guard
+
+⚡ Parallel video fetch (capped workers)
+
+🌍 Multi-channel ingestion
+
+🚨 Slack + Email alerts
+
+🧬 Run lineage
+
+🧊 Bronze raw JSON
+
+🏦 Silver upsert
+
+📈 Metrics snapshots
+
+🪣 Partitioned data lake
+
+This is now enterprise-grade ingestion architecture.
+
+
+real production system 🚀
+
+You are about to build:
+
+🐳 Fully Dockerized ELT service
+
+🌬 Airflow orchestrated pipeline
+
+🔁 GitHub Actions CI/CD
+
+✅ Data quality checks
+
+📊 Supabase production dashboard views
+
+This is how real data platforms are built.
+
+🔥 1️⃣ DOCKERIZE THE WHOLE PIPELINE
+1.1 Create Dockerfile
+
+At repo root:
+
+# Dockerfile
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install system deps
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements first (better caching)
+COPY requirements.txt .
+
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy entire project
+COPY . .
+
+ENV PYTHONPATH=/app/src
+
+CMD ["python", "-m", "youtube_elt.main"]
+1.2 Create requirements.txt
+requests
+python-dotenv
+pandas
+pyarrow
+sqlalchemy
+psycopg2-binary
+1.3 Create .dockerignore
+__pycache__/
+*.pyc
+.env
+.git
+data/
+1.4 Build & Run
+docker build -t youtube-elt .
+docker run --env-file .env youtube-elt
+
+Now your pipeline runs in a clean container.
+
+🔥 2️⃣ AIRFLOW + DOCKER COMPOSE
+
+We’ll run:
+
+Postgres (Airflow metadata DB)
+
+Airflow scheduler
+
+Airflow webserver
+
+Your ELT container
+
+2.1 Create docker-compose.yml
+version: "3.8"
+
+services:
+
+  postgres:
+    image: postgres:14
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    ports:
+      - "5433:5432"
+
+  airflow:
+    image: apache/airflow:2.7.0
+    depends_on:
+      - postgres
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - .:/opt/airflow/app
+    ports:
+      - "8080:8080"
+    command: >
+      bash -c "
+      airflow db init &&
+      airflow users create --username admin --password admin --firstname admin --lastname admin --role Admin --email admin@example.com &&
+      airflow webserver & airflow scheduler
+      "
+
+  youtube-elt:
+    build: .
+    env_file:
+      - .env
+    depends_on:
+      - airflow
+2.2 Airflow DAG
+
+dags/youtube_elt_dag.py
+
+from datetime import datetime
+from airflow import DAG
+from airflow.operators.bash import BashOperator
+
+with DAG(
+    dag_id="youtube_elt_daily",
+    start_date=datetime(2025, 1, 1),
+    schedule="@daily",
+    catchup=False,
+) as dag:
+
+    run_pipeline = BashOperator(
+        task_id="run_youtube_elt",
+        bash_command="docker run --env-file /opt/airflow/app/.env youtube-elt"
+    )
+2.3 Start everything
+docker compose up --build
+
+Airflow UI:
+http://localhost:8080
+
+Login: admin / admin
+
+You now have real orchestration.
+
+🔥 3️⃣ CI/CD WITH GITHUB ACTIONS
+
+Create .github/workflows/pipeline.yml
+
+name: YouTube ELT CI
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: 3.11
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Lint check
+        run: |
+          pip install flake8
+          flake8 src/
+
+      - name: Build Docker image
+        run: docker build -t youtube-elt .
+
+
+Later you can add:
+
+push to Docker Hub
+
+deploy to VPS
+
+run scheduled pipeline
+
+🔥 4️⃣ DATA QUALITY CHECKS
+
+Add a simple but powerful quality layer.
+
+Create: src/youtube_elt/data_quality.py
+
+from sqlalchemy import text
+from sqlalchemy.engine import Engine
+
+def run_data_quality_checks(engine: Engine):
+    with engine.begin() as conn:
+
+        # Check no null video_ids
+        null_check = conn.execute(
+            text("select count(*) from public.youtube_videos where video_id is null")
+        ).scalar()
+
+        if null_check > 0:
+            raise ValueError("Data Quality Failed: NULL video_id detected")
+
+        # Check row count > 0
+        row_count = conn.execute(
+            text("select count(*) from public.youtube_videos")
+        ).scalar()
+
+        if row_count == 0:
+            raise ValueError("Data Quality Failed: Table is empty")
+
+    print("✅ Data Quality Passed")
+
+Call it in main.py after upsert:
+
+from .data_quality import run_data_quality_checks
+
+run_data_quality_checks(engine)
+🔥 5️⃣ SUPABASE DASHBOARD VIEWS
+
+Run these in Supabase SQL:
+
+📊 1. Top 10 Videos
+create or replace view public.v_top_10_videos as
+select
+  video_id,
+  title,
+  view_count,
+  like_count,
+  comment_count,
+  published_at
+from public.youtube_videos
+order by view_count desc nulls last
+limit 10;
+📈 2. Daily Channel Growth
+create or replace view public.v_daily_channel_growth as
+select
+  date_trunc('day', captured_at) as day,
+  sum(view_count) as total_views
+from public.youtube_video_metrics_snapshots
+group by 1
+order by 1;
+🚀 3. Fastest Growing Videos (7 Days)
+create or replace view public.v_fastest_growing_7d as
+with recent as (
+  select
+    video_id,
+    min(view_count) as views_start,
+    max(view_count) as views_end
+  from public.youtube_video_metrics_snapshots
+  where captured_at >= now() - interval '7 days'
+  group by 1
+)
+select
+  r.video_id,
+  v.title,
+  (views_end - views_start) as growth
+from recent r
+join public.youtube_videos v using (video_id)
+order by growth desc;
+
+Now Supabase dashboard can directly visualize these.
+
+🏆 What You Built
+
+You now have:
+
+🐳 Containerized pipeline
+🌬 Airflow orchestration
+🔁 CI/CD
+📊 Data warehouse
+📈 Snapshots
+🧬 Lineage
+🚨 Alerts
+🛑 Quota guard
+⚡ Parallel fetch
+🌍 Multi-channel ingestion
+🪣 Partitioned lake
+🧪 Data quality layer
+📊 Production dashboard views
+
+This is a real-world data engineering stack.
+
+==========================================================
+production-ready implementation plan for each item, with the exact AWS/EKS pieces you’ll use.
+
+1) IRSA (IAM Roles for Service Accounts) 🔐
+Why
+
+Pods get least-privilege AWS access (no node IAM creds, no static keys).
+
+Steps
+
+Associate OIDC provider with your cluster:
+
+eksctl utils associate-iam-oidc-provider \
+  --region us-east-1 \
+  --cluster youtube-data-platform \
+  --approve
+
+Create an IAM policy (example: allow reading secrets only):
+secrets-read-policy.json
+
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadSecrets",
+      "Effect": "Allow",
+      "Action": [
+        "secretsmanager:GetSecretValue",
+        "secretsmanager:DescribeSecret"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+aws iam create-policy \
+  --policy-name YouTubeEltSecretsRead \
+  --policy-document file://secrets-read-policy.json
+
+Create Kubernetes service account + IAM role (IRSA):
+
+eksctl create iamserviceaccount \
+  --cluster youtube-data-platform \
+  --region us-east-1 \
+  --namespace airflow \
+  --name youtube-elt-sa \
+  --attach-policy-arn arn:aws:iam::<ACCOUNT_ID>:policy/YouTubeEltSecretsRead \
+  --approve \
+  --override-existing-serviceaccounts
+
+In your KubernetesPodOperator, set:
+
+service_account_name="youtube-elt-sa"
+
+2) AWS Secrets Manager integration 🧰
+
+You have two solid options. Pick one:
+
+Option A (recommended): External Secrets Operator (ESO)
+
+Best for mapping Secrets Manager → Kubernetes Secrets automatically.
+
+Install ESO:
+
+helm repo add external-secrets https://charts.external-secrets.io
+helm repo update
+helm install external-secrets external-secrets/external-secrets -n external-secrets --create-namespace
+
+Create a Secret in AWS Secrets Manager like:
+
+youtube-elt/prod
+with JSON:
+
+{
+  "YOUTUBE_API_KEY": "xxx",
+  "DATABASE_URL": "postgresql+psycopg2://...",
+  "SLACK_WEBHOOK_URL": "https://hooks.slack.com/..."
+}
+
+Create SecretStore (uses IRSA via the service account):
+
+apiVersion: external-secrets.io/v1beta1
+kind: SecretStore
+metadata:
+  name: aws-secretsmanager
+  namespace: airflow
+spec:
+  provider:
+    aws:
+      service: SecretsManager
+      region: us-east-1
+      auth:
+        jwt:
+          serviceAccountRef:
+            name: youtube-elt-sa
+
+Create an ExternalSecret to sync into K8s Secret:
+
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: youtube-elt-secrets
+  namespace: airflow
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: aws-secretsmanager
+    kind: SecretStore
+  target:
+    name: youtube-elt-secrets
+    creationPolicy: Owner
+  dataFrom:
+    - extract:
+        key: youtube-elt/prod
+
+In the PodOperator, use env from K8s Secret:
+
+env_from=[{"secretRef": {"name": "youtube-elt-secrets"}}] (or map keys explicitly depending on your operator version)
+
+Option B: Secrets Store CSI Driver
+
+Best for mounting secrets as files. Works too, but slightly more moving parts.
+
+3) Blue/Green deployment 🚦
+
+Goal: deploy new pipeline versions safely.
+
+For your ELT image (KubernetesPodOperator)
+
+Best pattern is immutable image tags + Airflow Variable controlling which tag runs.
+
+Push images as:
+
+youtube-elt:2026-02-25-001
+
+youtube-elt:2026-02-25-002
+
+Airflow Variable:
+
+YOUTUBE_ELT_IMAGE_TAG=2026-02-25-001
+
+DAG uses:
+
+ECR_IMAGE = f"<ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/youtube-elt:{{{{ var.value.YOUTUBE_ELT_IMAGE_TAG }}}}"
+
+Blue/Green process:
+
+Deploy new tag to “green”
+
+Run canary DAG (next section)
+
+Switch variable to green tag
+
+Keep blue tag available for instant rollback (switch variable back)
+
+This is the simplest and most reliable “blue/green” for batch jobs.
+
+4) Canary data pipeline testing 🧪
+
+Goal: validate new code against a small slice before full rollout.
+
+Canary strategy (recommended)
+
+A separate DAG: youtube_elt_canary
+
+Runs on:
+
+one channel only, or
+
+max 25 videos, or
+
+one day lookback
+
+Writes to canary tables or same tables but tagged (meta.mode=canary)
+
+Implementation
+
+Add env var/param in your pipeline:
+
+PIPELINE_MODE=canary
+
+MAX_VIDEOS_PER_RUN=25
+
+Canary DAG:
+
+schedule: manual or hourly
+
+uses “green” image tag first
+
+Canary checks:
+
+Data quality passes
+
+Quota usage under limit
+
+Row counts nonzero
+
+No schema/type errors
+
+Optional: compare aggregate totals vs prior run within expected tolerance
+
+Add a “canary assertion” query (example)
+
+Fail if views drop > 80% day-over-day for total channel views:
+
+with d as (
+  select date_trunc('day', captured_at) as day, sum(view_count) as total
+  from public.youtube_video_metrics_snapshots
+  where captured_at >= now() - interval '2 days'
+  group by 1
+)
+select
+  case when (max(total) < 0.2 * min(total)) then 1 else 0 end as fail
+from d;
+
+If fail=1 → alert + don’t promote.
+
+5) Cost optimization dashboards 💸📊
+
+You want visibility into:
+
+EKS node cost
+
+Airflow worker scaling cost
+
+Storage costs
+
+Network egress
+
+Cost per pipeline run
+
+Stack
+
+Kubecost (best immediate win)
+
+helm repo add kubecost https://kubecost.github.io/cost-analyzer/
+helm repo update
+helm install kubecost kubecost/cost-analyzer -n kubecost --create-namespace
+
+Grafana dashboards
+
+Add Kubecost as a data source (or use its UI)
+
+Add Postgres (Supabase) datasource for pipeline-level metrics
+
+“Cost per run” (approx) inside Supabase
+
+Track in pipeline_runs.meta:
+
+api_calls, units_used, videos_fetched, duration_sec
+Then Grafana can chart “cost proxy” like:
+
+units_used * (your assumed $/unit) + duration_sec * (cpu cost proxy)
+
+AWS-native (optional)
+
+Cost Explorer + CUR (Cost & Usage Report) to S3 + Athena queries
+
+Combine with namespace labels to attribute costs by team/app.
+
+6) Multi-region failover 🌍🛟
+
+You have a batch system. Best is active-passive.
+
+Target design
+
+Primary: us-east-1 EKS + Airflow
+
+Secondary: us-west-2 EKS + Airflow (warm standby)
+
+Supabase stays as-is (external). Your pipeline can run from either region.
+
+What to replicate
+
+ECR: replicate images cross-region
+
+Enable ECR replication (AWS console) from us-east-1 → us-west-2
+
+Secrets Manager: replicate secrets
+
+Use Secrets Manager replication to us-west-2
+
+DAGs:
+
+Store DAGs in Git (source of truth) and deploy to both
+
+Or store DAGs in S3 and sync to both clusters
+
+Airflow metadata DB
+
+If using Postgres inside cluster: not ideal for DR
+
+For real DR: use RDS PostgreSQL Multi-AZ (and optionally cross-region read replica)
+
+Configure Airflow to use that external DB so failover is clean
+
+Failover procedure (practical)
+
+Detect failure (Grafana alert / CloudWatch)
+
+Route traffic to standby Airflow UI (Route53 failover record)
+
+Enable standby scheduler (or scale it up)
+
+Standby runs pipelines using replicated secrets + same Supabase target
+
+When primary returns, switch back
+
+Minimal “next actions” checklist ✅
+
+IRSA + OIDC provider
+
+Install External Secrets Operator
+
+Put pipeline secrets in Secrets Manager (youtube-elt/prod)
+
+Create youtube-elt-sa + SecretStore + ExternalSecret
+
+Update DAG to use service_account_name and env from K8s Secret
+
+Implement image-tag variable for Blue/Green
+
+Add canary DAG + canary DQ checks
+
+Install Kubecost + wire Grafana dashboards
+
+Set up ECR + Secrets replication to us-west-2
+
+Standby cluster + Route53 failover (optional UI)
+
+If you want, paste your current Airflow DAG file and I’ll return a final version that includes:
+
+service_account_name="youtube-elt-sa"
+
+env loaded from youtube-elt-secrets
+
+blue/green image tag variable
+
+canary DAG variant (small-run)
+
+Airflow DAG
+
+dags/youtube_elt_dag.py
+
+from datetime import datetime
+from airflow import DAG
+from airflow.operators.bash import BashOperator
+
+with DAG(
+    dag_id="youtube_elt_daily",
+    start_date=datetime(2025, 1, 1),
+    schedule="@daily",
+    catchup=False,
+) as dag:
+
+    run_pipeline = BashOperator(
+        task_id="run_youtube_elt",
+        bash_command="docker run --env-file /opt/airflow/app/.env youtube-elt"
+    )
+2.3 Start everything
+docker compose up --build
+
+Airflow UI:
+http://localhost:8080
+
+Login: admin / admin
+
+You now have real orchestration.
+
+Here are final, production-grade DAGs that replace your BashOperator approach and add everything you asked for:
+
+✅ KubernetesPodOperator (runs your ECR image in EKS)
+✅ IRSA service account (youtube-elt-sa)
+✅ Secrets Manager → Kubernetes Secret via External Secrets (youtube-elt-secrets)
+✅ Blue/Green via Airflow Variable (YOUTUBE_ELT_IMAGE_TAG)
+✅ Canary DAG for safe promotion
+✅ Weekly full refresh is still handled inside your pipeline code (Sunday)
+
+1) Install Airflow provider (required) 📦
+
+In your Airflow Helm values, make sure the Kubernetes provider is available. Most Airflow images already include it, but if not, add:
+
+Option A (preferred): use an image that includes providers
+Option B: add in Helm values:
+
+airflow:
+  extraPipPackages:
+    - apache-airflow-providers-cncf-kubernetes
+2) Replace your DAG with KubernetesPodOperator (Daily) ✅
+
+File: dags/youtube_elt_dag.py
+
+from datetime import datetime
+from airflow import DAG
+from airflow.models import Variable
+from airflow.providers.cncf.kubernetes.operators.kubernetes_pod import KubernetesPodOperator
+
+AWS_ACCOUNT_ID = Variable.get("AWS_ACCOUNT_ID")  # set in Airflow Variables
+AWS_REGION = "us-east-1"
+
+IMAGE_TAG = Variable.get("YOUTUBE_ELT_IMAGE_TAG", default_var="latest")
+ECR_IMAGE = f"{AWS_ACCOUNT_ID}.dkr.ecr.{AWS_REGION}.amazonaws.com/youtube-elt:{IMAGE_TAG}"
+
+with DAG(
+    dag_id="youtube_elt_daily",
+    start_date=datetime(2025, 1, 1),
+    schedule="@daily",
+    catchup=False,
+    tags=["youtube", "elt", "prod"],
+) as dag:
+
+    run_pipeline = KubernetesPodOperator(
+        task_id="run_youtube_elt",
+        name="youtube-elt",
+        namespace="airflow",
+        image=ECR_IMAGE,
+        service_account_name="youtube-elt-sa",  # ✅ IRSA enabled SA
+        get_logs=True,
+        is_delete_operator_pod=True,
+        in_cluster=True,
+
+        # ✅ pulls env vars from K8s Secret created by External Secrets Operator
+        env_from=[
+            {"secretRef": {"name": "youtube-elt-secrets"}}
+        ],
+
+        # Optional: resource limits
+        container_resources={
+            "limits": {"cpu": "500m", "memory": "512Mi"},
+            "requests": {"cpu": "250m", "memory": "256Mi"},
+        },
+    )
+Airflow Variables you must set
+
+In Airflow UI → Admin → Variables:
+
+AWS_ACCOUNT_ID = your AWS account id
+
+YOUTUBE_ELT_IMAGE_TAG = 2026-02-25-001 (blue/green control)
+
+3) Add the Canary DAG (small safe test) 🧪
+
+File: dags/youtube_elt_canary_dag.py
+
+from datetime import datetime
+from airflow import DAG
+from airflow.models import Variable
+from airflow.providers.cncf.kubernetes.operators.kubernetes_pod import KubernetesPodOperator
+
+AWS_ACCOUNT_ID = Variable.get("AWS_ACCOUNT_ID")
+AWS_REGION = "us-east-1"
+
+# Canary runs the "green" candidate tag first
+CANARY_TAG = Variable.get("YOUTUBE_ELT_CANARY_TAG", default_var="latest")
+ECR_IMAGE = f"{AWS_ACCOUNT_ID}.dkr.ecr.{AWS_REGION}.amazonaws.com/youtube-elt:{CANARY_TAG}"
+
+with DAG(
+    dag_id="youtube_elt_canary",
+    start_date=datetime(2025, 1, 1),
+    schedule=None,  # manual trigger
+    catchup=False,
+    tags=["youtube", "elt", "canary"],
+) as dag:
+
+    run_canary = KubernetesPodOperator(
+        task_id="run_youtube_elt_canary",
+        name="youtube-elt-canary",
+        namespace="airflow",
+        image=ECR_IMAGE,
+        service_account_name="youtube-elt-sa",
+        get_logs=True,
+        is_delete_operator_pod=True,
+        in_cluster=True,
+
+        env_from=[{"secretRef": {"name": "youtube-elt-secrets"}}],
+
+        # ✅ Canary overrides (small blast radius)
+        env_vars={
+            "PIPELINE_MODE": "canary",
+            "MAX_VIDEOS_PER_RUN": "25",
+            "MAX_API_CALLS_PER_RUN": "50",
+            "MAX_UNITS_PER_RUN": "500",
+            "MAX_WORKERS": "2",
+        },
+    )
+Canary Variables
+
+Airflow Variables:
+
+YOUTUBE_ELT_CANARY_TAG = the “green” tag you want to test
+
+Promotion flow
+
+Push new image tag → set YOUTUBE_ELT_CANARY_TAG
+
+Run youtube_elt_canary manually
+
+If it passes, set YOUTUBE_ELT_IMAGE_TAG to that tag
+
+Rollback is instant: set YOUTUBE_ELT_IMAGE_TAG back.
+
+4) External Secrets + IRSA hookup reminder 🔐
+
+Your DAG assumes Kubernetes Secret exists:
+
+✅ youtube-elt-secrets in namespace airflow
+
+Created by External Secrets Operator from AWS Secrets Manager.
+
+Expected keys inside that secret:
+
+YOUTUBE_API_KEY
+
+DATABASE_URL
+
+SLACK_WEBHOOK_URL (optional)
+
+SMTP settings (optional)
+
+5) What to do with your old docker-compose approach 🧯
+
+Your old DAG ran Docker inside the Airflow container:
+
+bash_command="docker run ..."
+
+That’s fine for local dev, but on EKS it’s not the right pattern.
+
+Keep docker-compose only for local testing.
+On EKS, Airflow should run pods via KubernetesPodOperator (what you now have).
+
+6) Quick checklist ✅
+
+ ECR image pushed
+
+ Airflow on EKS via Helm running
+
+ IRSA service account youtube-elt-sa exists
+
+ External Secrets Operator installed
+
+ SecretStore + ExternalSecret created
+
+ K8s Secret youtube-elt-secrets present in airflow namespace
+
+ Airflow Variables set: AWS_ACCOUNT_ID, tags
